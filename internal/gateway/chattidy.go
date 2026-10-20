@@ -58,6 +58,9 @@ var (
 	emptyFinishReason = []byte(`"finish_reason":""`)
 	emptyToolName     = []byte(`"name":""`)
 	emptyToolCalls    = []byte(`"tool_calls":[]`)
+	promptCacheHit    = []byte(`"prompt_cache_hit_tokens"`)
+	bareCachedTokens  = []byte(`"cached_tokens"`)
+	cacheReadTokens   = []byte(`"cache_read_input_tokens"`)
 	contentParts      = []byte(`"content":[`)
 	contentPartsSpace = []byte(`"content": [`)
 	toolCallsField    = []byte(`"tool_calls"`)
@@ -107,6 +110,9 @@ func needsTidy(line []byte) bool {
 		bytes.Contains(line, emptyFinishReason) ||
 		bytes.Contains(line, emptyToolName) ||
 		bytes.Contains(line, emptyToolCalls) ||
+		bytes.Contains(line, promptCacheHit) ||
+		bytes.Contains(line, bareCachedTokens) ||
+		bytes.Contains(line, cacheReadTokens) ||
 		bytes.Contains(line, contentParts) ||
 		bytes.Contains(line, contentPartsSpace) ||
 		bytes.Contains(line, toolCallsField)
@@ -129,11 +135,9 @@ func (t *chatTidy) line(line []byte) []byte {
 	if decodeJSON(data, &chunk) != nil {
 		return line
 	}
+	changed := chatCacheDetails(chunk)
 	var choices []map[string]json.RawMessage
-	if decodeJSON(chunk["choices"], &choices) != nil {
-		return line
-	}
-	changed := false
+	choicesOK := decodeJSON(chunk["choices"], &choices) == nil
 	for k, c := range choices {
 		if string(c["finish_reason"]) == `""` {
 			c["finish_reason"] = json.RawMessage("null")
@@ -174,12 +178,47 @@ func (t *chatTidy) line(line []byte) []byte {
 	if !changed {
 		return line
 	}
-	chunk["choices"], _ = json.Marshal(choices)
+	if choicesOK {
+		chunk["choices"], _ = json.Marshal(choices)
+	}
 	nb, err := json.Marshal(chunk)
 	if err != nil {
 		return line
 	}
 	return append(append([]byte("data: "), nb...), end...)
+}
+
+// chatCacheDetails gives OpenAI-compatible clients the standard cache-read
+// field when an upstream reports the same count under another common name.
+func chatCacheDetails(reply map[string]json.RawMessage) bool {
+	var usage map[string]json.RawMessage
+	if decodeJSON(reply["usage"], &usage) != nil {
+		return false
+	}
+	var details map[string]json.RawMessage
+	if raw, ok := usage["prompt_tokens_details"]; ok {
+		if decodeJSON(raw, &details) != nil {
+			return false
+		}
+		if _, ok := details["cached_tokens"]; ok {
+			return false
+		}
+	}
+	var counts cUsage
+	if decodeJSON(reply["usage"], &counts) != nil {
+		return false
+	}
+	read := counts.usage().CacheRead
+	if read <= 0 {
+		return false
+	}
+	if details == nil {
+		details = map[string]json.RawMessage{}
+	}
+	details["cached_tokens"], _ = json.Marshal(read)
+	usage["prompt_tokens_details"], _ = json.Marshal(details)
+	reply["usage"], _ = json.Marshal(usage)
+	return true
 }
 
 // withoutEmptyNames drops the empty "name" on a delta's tool-call
@@ -298,18 +337,26 @@ func (t *chatWhole) flush() []byte {
 	b := t.buf
 	t.buf = nil
 	parts := bytes.Contains(b, contentParts) || bytes.Contains(b, contentPartsSpace)
-	if !parts && !mayWriteCalls(b, t.names) && !bytes.Contains(b, toolCallsField) {
+	cache := bytes.Contains(b, promptCacheHit) || bytes.Contains(b, bareCachedTokens) || bytes.Contains(b, cacheReadTokens)
+	if !parts && !mayWriteCalls(b, t.names) && !bytes.Contains(b, toolCallsField) && !cache {
 		return b
 	}
 	var reply map[string]json.RawMessage
 	if decodeJSON(b, &reply) != nil {
 		return b
 	}
+	changed := chatCacheDetails(reply)
 	var choices []map[string]json.RawMessage
 	if decodeJSON(reply["choices"], &choices) != nil {
-		return b
+		if !changed {
+			return b
+		}
+		nb, err := marshalPlain(reply)
+		if err != nil {
+			return b
+		}
+		return nb
 	}
-	changed := false
 	for _, c := range choices {
 		var msg map[string]json.RawMessage
 		if decodeJSON(c["message"], &msg) != nil {

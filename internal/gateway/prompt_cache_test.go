@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -81,6 +82,48 @@ func TestCodexThreadOnChatUpstreamCaches(t *testing.T) {
 		if !bytes.Equal(a.Messages[i], b.Messages[i]) {
 			t.Errorf("message %d changed between turns:\n%s\n%s", i, a.Messages[i], b.Messages[i])
 		}
+	}
+}
+
+// DSH reads cache hits from OpenAI's prompt_tokens_details.cached_tokens.
+// DeepSeek spells the same count prompt_cache_hit_tokens, so a relayed Chat
+// reply gives DSH the standard field while keeping DeepSeek's own fields.
+func TestDSHChatReplyGetsCachedTokens(t *testing.T) {
+	for _, stream := range []bool{true, false} {
+		t.Run(map[bool]string{true: "stream", false: "whole"}[stream], func(t *testing.T) {
+			usage := `"usage":{"prompt_tokens":3000,"completion_tokens":2,"prompt_cache_hit_tokens":2048,"prompt_cache_miss_tokens":952}`
+			body, contentType := `{"id":"c1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],`+usage+`}`, "application/json"
+			if stream {
+				body, contentType = sse(`data: {"id":"c1","choices":[{"delta":{"content":"ok"}}]}`,
+					`data: {"id":"c1","choices":[],`+usage+`}`,
+					`data: [DONE]`), "text/event-stream"
+			}
+			a := &scripted{replies: []reply{{200, contentType, body}}}
+			scriptedOn(t, "deepseek", provider.Chat, a)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+				`{"model":"deepseek/m","stream":`+map[bool]string{true: "true", false: "false"}[stream]+`,"messages":[{"role":"user","content":"hi"}]}`))
+			req.Header.Set("User-Agent", "dsh/0.2.0")
+			New().Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("HTTP %d: %s", rec.Code, rec.Body.String())
+			}
+			var got map[string]any
+			if stream {
+				for _, event := range events(rec.Body.String()) {
+					if event["usage"] != nil {
+						got = event
+					}
+				}
+			} else if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			u, _ := got["usage"].(map[string]any)
+			details, _ := u["prompt_tokens_details"].(map[string]any)
+			if details["cached_tokens"] != float64(2048) || u["prompt_cache_hit_tokens"] != float64(2048) {
+				t.Fatalf("cache hit did not reach DSH in both spellings: %s", rec.Body.String())
+			}
+		})
 	}
 }
 
